@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <NetworkClient.h>
-#include <NetworkServer.h>
+#include <lwip/sockets.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,13 +12,13 @@ static const int BLINK_PIN = 6;
 static const unsigned long HALF_MS = 125;
 static const unsigned long WIFI_WAIT_MS = 20000;
 
-static NetworkServer server(80);
 static char page[900];
 static char reqLine[160];
 static uint32_t clickCount;
 static int blinkLevel;
 static unsigned long nextBlinkMs;
 static int wifiReady;
+static int listenSock;
 
 static void blinkTick(void)
 {
@@ -59,45 +58,53 @@ static int connectWifi(void)
 	return 0;
 }
 
-static int readRequestLine(NetworkClient &client)
+static int startServer(void)
 {
-	size_t n;
-	int c;
-	unsigned long start;
+	struct sockaddr_in addr;
+	int yes;
 
-	n = 0;
-	start = millis();
-	while (client.connected() && (long)(millis() - start) < 2000) {
-		if (!client.available()) {
-			delay(1);
-			continue;
-		}
-		c = client.read();
-		if (c < 0)
-			continue;
-		if (c == '\n')
-			break;
-		if (c == '\r')
-			continue;
-		if (n + 1 < sizeof(reqLine)) {
-			reqLine[n] = (char)c;
-			n++;
-		}
-	}
-	reqLine[n] = 0;
+	listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+	if (listenSock < 0)
+		return 0;
 
-	/* дочитать и отбросить остальные заголовки */
-	while (client.connected() && client.available()) {
-		c = client.read();
-		if (c < 0)
-			break;
+	yes = 1;
+	setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(80);
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(listenSock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(listenSock);
+		listenSock = -1;
+		return 0;
 	}
-	return (int)n;
+	if (listen(listenSock, 2) < 0) {
+		close(listenSock);
+		listenSock = -1;
+		return 0;
+	}
+	fcntl(listenSock, F_SETFL, O_NONBLOCK);
+	return 1;
 }
 
-static void sendPage(NetworkClient &client)
+static void sendAll(int sock, const char *data, size_t len)
+{
+	int sent;
+
+	while (len) {
+		sent = send(sock, data, len, 0);
+		if (sent <= 0)
+			return;
+		data += sent;
+		len -= (size_t)sent;
+	}
+}
+
+static void sendPage(int sock)
 {
 	IPAddress lip;
+	char header[160];
+	int hlen;
 	int n;
 	int rssi;
 
@@ -129,25 +136,38 @@ static void sendPage(NetworkClient &client)
 	if (n >= (int)sizeof(page))
 		n = (int)sizeof(page) - 1;
 
-	client.print("HTTP/1.1 200 OK\r\n");
-	client.print("Content-Type: text/html\r\n");
-	client.print("Connection: close\r\n");
-	client.print("Content-Length: ");
-	client.println(n);
-	client.print("\r\n");
-	client.write((const uint8_t *)page, (size_t)n);
+	hlen = snprintf(header, sizeof(header),
+		"HTTP/1.1 200 OK\r\n"
+		"Content-Type: text/html\r\n"
+		"Connection: close\r\n"
+		"Content-Length: %d\r\n\r\n", n);
+	if (hlen > 0) {
+		sendAll(sock, header, (size_t)hlen);
+		sendAll(sock, page, (size_t)n);
+	}
 }
 
 static void handleClient(void)
 {
-	NetworkClient client;
+	struct sockaddr_in from;
+	socklen_t fromLen;
+	struct timeval timeout;
+	int client;
+	int n;
 	int isClick;
 
-	client = server.accept();
-	if (!client)
+	fromLen = sizeof(from);
+	client = accept(listenSock, (struct sockaddr *)&from, &fromLen);
+	if (client < 0)
 		return;
 
-	readRequestLine(client);
+	timeout.tv_sec = 2;
+	timeout.tv_usec = 0;
+	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	n = recv(client, reqLine, sizeof(reqLine) - 1, 0);
+	if (n < 0)
+		n = 0;
+	reqLine[n] = 0;
 	Serial.print("REQ ");
 	Serial.println(reqLine);
 
@@ -156,7 +176,8 @@ static void handleClient(void)
 		clickCount++;
 
 	sendPage(client);
-	client.stop();
+	shutdown(client, SHUT_RDWR);
+	close(client);
 }
 
 void setup(void)
@@ -166,6 +187,7 @@ void setup(void)
 	blinkLevel = 0;
 	nextBlinkMs = millis() + HALF_MS;
 	wifiReady = 0;
+	listenSock = -1;
 
 	Serial.begin(115200);
 	delay(200);
@@ -176,7 +198,10 @@ void setup(void)
 	if (!wifiReady)
 		return;
 
-	server.begin();
+	if (!startServer()) {
+		Serial.println("Server start failed");
+		return;
+	}
 
 	Serial.print("SSID ");
 	Serial.println(WIFI_SSID);
@@ -193,9 +218,13 @@ void loop(void)
 		return;
 	if (WiFi.status() != WL_CONNECTED) {
 		Serial.println("WiFi lost, reconnect");
+		if (listenSock >= 0) {
+			close(listenSock);
+			listenSock = -1;
+		}
 		wifiReady = connectWifi();
 		if (wifiReady)
-			server.begin();
+			wifiReady = startServer();
 		return;
 	}
 	handleClient();
