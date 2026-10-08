@@ -4,4 +4,5 @@
 managed_components
 sdkconfig
 sdkconfig.*
+!sdkconfig.defaults
 dependencies.lock
