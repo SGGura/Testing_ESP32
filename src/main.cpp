@@ -5,7 +5,7 @@
 
 /* Подключается к домашней сети и отдаёт страницу по полученному IP.
    GPIO6 мигает с частотой 4 Гц: полупериод 125 мс. */
-static const char WIFI_SSID[] = "GORAWORK";
+static const char WIFI_SSID[] = "GURAWORK";
 static const char WIFI_PASS[] = "GURA03071963";
 static const int BLINK_PIN = 6;
 static const unsigned long HALF_MS = 125;
