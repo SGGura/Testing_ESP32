@@ -100,6 +100,50 @@ static void sendAll(int sock, const char *data, size_t len)
 	}
 }
 
+static int readHeaders(int sock)
+{
+	char rx[256];
+	char c;
+	char h1;
+	char h2;
+	char h3;
+	char h4;
+	int count;
+	int n;
+	int total;
+	size_t lineLen;
+
+	h1 = 0;
+	h2 = 0;
+	h3 = 0;
+	h4 = 0;
+	lineLen = 0;
+	total = 0;
+	reqLine[0] = 0;
+
+	while (total < 4096) {
+		n = recv(sock, rx, sizeof(rx), 0);
+		if (n <= 0)
+			break;
+		total += n;
+		for (count = 0; count < n; count++) {
+			c = rx[count];
+			if (lineLen + 1 < sizeof(reqLine) && c != '\r' && c != '\n') {
+				reqLine[lineLen] = c;
+				lineLen++;
+				reqLine[lineLen] = 0;
+			}
+			h1 = h2;
+			h2 = h3;
+			h3 = h4;
+			h4 = c;
+			if (h1 == '\r' && h2 == '\n' && h3 == '\r' && h4 == '\n')
+				return total;
+		}
+	}
+	return total;
+}
+
 static void sendPage(int sock)
 {
 	IPAddress lip;
@@ -153,7 +197,6 @@ static void handleClient(void)
 	socklen_t fromLen;
 	struct timeval timeout;
 	int client;
-	int n;
 	int isClick;
 
 	fromLen = sizeof(from);
@@ -164,10 +207,7 @@ static void handleClient(void)
 	timeout.tv_sec = 2;
 	timeout.tv_usec = 0;
 	setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-	n = recv(client, reqLine, sizeof(reqLine) - 1, 0);
-	if (n < 0)
-		n = 0;
-	reqLine[n] = 0;
+	readHeaders(client);
 	Serial.print("REQ ");
 	Serial.println(reqLine);
 
@@ -176,7 +216,7 @@ static void handleClient(void)
 		clickCount++;
 
 	sendPage(client);
-	shutdown(client, SHUT_RDWR);
+	shutdown(client, SHUT_WR);
 	close(client);
 }
 
