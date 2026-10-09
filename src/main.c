@@ -29,19 +29,26 @@
 #define WEATHER_PERIOD_MS 60000
 #define WEATHER_HTTP_BUF 4096
 #define WEATHER_FORECAST_DAYS 3
-#define PAGE_BUF_SIZE 10240
-#define FORECAST_BUF_SIZE 2048
+#define CITY_COUNT 2
+#define PAGE_BUF_SIZE 16384
+#define CITIES_HTML_SIZE 8192
 #define CPU_HIST_LEN 60
 #define CPU_SAMPLE_MS 1000
 #define ICON_CDN \
 	"https://cdn.jsdelivr.net/gh/basmilius/weather-icons@dev/production/fill/svg/"
 
-#define WEATHER_URL \
-	"https://api.open-meteo.com/v1/forecast" \
-	"?latitude=48.45&longitude=35.04" \
+#define WEATHER_QUERY \
 	"&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m" \
 	"&daily=weather_code,temperature_2m_max,temperature_2m_min" \
 	"&timezone=Europe%2FKyiv&forecast_days=3"
+
+#define WEATHER_URL_DNIPRO \
+	"https://api.open-meteo.com/v1/forecast?latitude=48.45&longitude=35.04" \
+	WEATHER_QUERY
+
+#define WEATHER_URL_TRUSKAVETS \
+	"https://api.open-meteo.com/v1/forecast?latitude=49.28&longitude=23.51" \
+	WEATHER_QUERY
 
 static const char *TAG = "esp8684";
 static EventGroupHandle_t wifi_event_group;
@@ -139,9 +146,23 @@ typedef struct {
 	char status[48];
 } weather_info_t;
 
-static weather_info_t weather_info = {
-	.valid = false,
-	.status = "ожидание...",
+typedef struct {
+	const char *name;
+	const char *url;
+	weather_info_t info;
+} city_weather_t;
+
+static city_weather_t g_cities[CITY_COUNT] = {
+	{
+		.name = "Днепр",
+		.url = WEATHER_URL_DNIPRO,
+		.info = { .valid = false, .status = "ожидание..." },
+	},
+	{
+		.name = "Трускавец",
+		.url = WEATHER_URL_TRUSKAVETS,
+		.info = { .valid = false, .status = "ожидание..." },
+	},
 };
 
 static int float_to_x10(double v)
@@ -328,15 +349,15 @@ static esp_err_t weather_http_event(esp_http_client_event_t *evt)
 	return ESP_OK;
 }
 
-static void weather_set_status(const char *status)
+static void weather_set_city_status(int idx, const char *status)
 {
 	xSemaphoreTake(weather_mutex, portMAX_DELAY);
-	strncpy(weather_info.status, status, sizeof(weather_info.status) - 1);
-	weather_info.status[sizeof(weather_info.status) - 1] = '\0';
+	strncpy(g_cities[idx].info.status, status, sizeof(g_cities[idx].info.status) - 1);
+	g_cities[idx].info.status[sizeof(g_cities[idx].info.status) - 1] = '\0';
 	xSemaphoreGive(weather_mutex);
 }
 
-static bool weather_parse_json(const char *json)
+static bool weather_parse_json(const char *json, weather_info_t *dst)
 {
 	cJSON *root;
 	cJSON *current;
@@ -430,25 +451,23 @@ static bool weather_parse_json(const char *json)
 	}
 
 	cJSON_Delete(root);
-
-	xSemaphoreTake(weather_mutex, portMAX_DELAY);
-	weather_info = next;
-	xSemaphoreGive(weather_mutex);
+	*dst = next;
 	return ok;
 }
 
-static void weather_fetch_once(void)
+static void weather_fetch_city(int idx)
 {
 	esp_http_client_config_t cfg;
 	esp_http_client_handle_t client;
 	http_accum_t acc;
+	weather_info_t parsed;
 	esp_err_t err;
 	int status;
 	char *body;
 
 	body = malloc(WEATHER_HTTP_BUF);
 	if (!body) {
-		weather_set_status("нет памяти");
+		weather_set_city_status(idx, "нет памяти");
 		ESP_LOGE(TAG, "weather malloc failed");
 		return;
 	}
@@ -459,7 +478,7 @@ static void weather_fetch_once(void)
 	acc.cap = WEATHER_HTTP_BUF;
 
 	memset(&cfg, 0, sizeof(cfg));
-	cfg.url = WEATHER_URL;
+	cfg.url = g_cities[idx].url;
 	cfg.timeout_ms = 15000;
 	cfg.event_handler = weather_http_event;
 	cfg.user_data = &acc;
@@ -467,12 +486,12 @@ static void weather_fetch_once(void)
 	cfg.buffer_size = 1024;
 	cfg.buffer_size_tx = 1024;
 
-	weather_set_status("обновление...");
-	ESP_LOGI(TAG, "weather fetch start");
+	weather_set_city_status(idx, "обновление...");
+	ESP_LOGI(TAG, "weather fetch %s", g_cities[idx].name);
 
 	client = esp_http_client_init(&cfg);
 	if (!client) {
-		weather_set_status("http init fail");
+		weather_set_city_status(idx, "http init fail");
 		free(body);
 		return;
 	}
@@ -482,30 +501,43 @@ static void weather_fetch_once(void)
 	esp_http_client_cleanup(client);
 
 	if (err != ESP_OK) {
-		weather_set_status("сеть/TLS ошибка");
-		ESP_LOGE(TAG, "weather http err=%s", esp_err_to_name(err));
+		weather_set_city_status(idx, "сеть/TLS ошибка");
+		ESP_LOGE(TAG, "weather %s err=%s", g_cities[idx].name, esp_err_to_name(err));
 		free(body);
 		return;
 	}
 	if (status != 200) {
-		weather_set_status("HTTP не 200");
-		ESP_LOGE(TAG, "weather http status=%d", status);
+		weather_set_city_status(idx, "HTTP не 200");
+		ESP_LOGE(TAG, "weather %s status=%d", g_cities[idx].name, status);
 		free(body);
 		return;
 	}
 	if (acc.len <= 0) {
-		weather_set_status("пустой ответ");
+		weather_set_city_status(idx, "пустой ответ");
 		free(body);
 		return;
 	}
 
-	if (weather_parse_json(body))
-		ESP_LOGI(TAG, "weather ok temp=%d.%d",
-			 weather_info.temp_x10 / 10, abs(weather_info.temp_x10 % 10));
-	else
-		ESP_LOGE(TAG, "weather json parse failed");
+	if (weather_parse_json(body, &parsed)) {
+		xSemaphoreTake(weather_mutex, portMAX_DELAY);
+		g_cities[idx].info = parsed;
+		xSemaphoreGive(weather_mutex);
+		ESP_LOGI(TAG, "weather %s ok temp=%d.%d", g_cities[idx].name,
+			 parsed.temp_x10 / 10, abs(parsed.temp_x10 % 10));
+	} else {
+		weather_set_city_status(idx, "ошибка разбора");
+		ESP_LOGE(TAG, "weather %s json parse failed", g_cities[idx].name);
+	}
 
 	free(body);
+}
+
+static void weather_fetch_once(void)
+{
+	int i;
+
+	for (i = 0; i < CITY_COUNT; i++)
+		weather_fetch_city(i);
 }
 
 static void weather_task(void *arg)
@@ -519,37 +551,106 @@ static void weather_task(void *arg)
 	}
 }
 
-static void weather_copy(weather_info_t *out)
+static void weather_copy_all(city_weather_t *out)
 {
 	xSemaphoreTake(weather_mutex, portMAX_DELAY);
-	*out = weather_info;
+	memcpy(out, g_cities, sizeof(g_cities));
 	xSemaphoreGive(weather_mutex);
+}
+
+static int append_city_html(char *buf, int cap, int used, const city_weather_t *city)
+{
+	const weather_info_t *w;
+	const char *icon;
+	char temp_s[16];
+	char wind_s[16];
+	char tmax_s[16];
+	char tmin_s[16];
+	char days_html[900];
+	int days_used;
+	int n;
+	int i;
+
+	w = &city->info;
+	icon = weather_icon_slug(w->valid ? w->weather_code : -1);
+	format_temp_x10(w->temp_x10, temp_s, sizeof(temp_s));
+	format_temp_x10(w->wind_x10, wind_s, sizeof(wind_s));
+
+	days_used = 0;
+	days_html[0] = '\0';
+	if (w->valid) {
+		for (i = 0; i < WEATHER_FORECAST_DAYS; i++) {
+			if (w->day_date[i][0] == '\0')
+				continue;
+			format_temp_x10(w->day_tmax_x10[i], tmax_s, sizeof(tmax_s));
+			format_temp_x10(w->day_tmin_x10[i], tmin_s, sizeof(tmin_s));
+			n = snprintf(days_html + days_used, sizeof(days_html) - days_used,
+				"<article class=\"day\">"
+				"<img class=\"ico\" src=\"%s%s.svg\" alt=\"\" width=\"72\" height=\"72\">"
+				"<div class=\"day-date\">%s</div>"
+				"<div class=\"day-temp\">%s…%s°</div>"
+				"<div class=\"day-desc\">%s</div>"
+				"</article>",
+				ICON_CDN, weather_icon_slug(w->day_code[i]),
+				w->day_date[i], tmin_s, tmax_s, w->day_text[i]);
+			if (n < 0 || days_used + n >= (int)sizeof(days_html))
+				break;
+			days_used += n;
+		}
+	} else {
+		snprintf(days_html, sizeof(days_html),
+			 "<article class=\"day\"><div class=\"day-desc\">нет данных</div></article>");
+	}
+
+	n = snprintf(buf + used, cap - used,
+		"<section class=\"city\">"
+		"<h1>%s</h1>"
+		"<section class=\"now\">"
+		"<img src=\"%s%s.svg\" alt=\"%s\" width=\"120\" height=\"120\">"
+		"<div><p class=\"temp\">%s°</p><p class=\"desc\">%s</p></div>"
+		"<div class=\"meta\">"
+		"<span>влажность %d%%</span>"
+		"<span>ветер %s км/ч</span>"
+		"<span>обновлено %s</span>"
+		"<span>%s</span>"
+		"</div></section>"
+		"<h2>Прогноз</h2>"
+		"<div class=\"days\">%s</div>"
+		"</section>",
+		city->name,
+		ICON_CDN, icon, w->valid ? w->weather_text : "погода",
+		w->valid ? temp_s : "--",
+		w->valid ? w->weather_text : w->status,
+		w->valid ? w->humidity : 0,
+		w->valid ? wind_s : "--",
+		w->updated[0] ? w->updated : "-",
+		w->status,
+		days_html);
+	if (n < 0 || used + n >= cap)
+		return -1;
+	return used + n;
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
 	char *page;
-	char *forecast;
+	char *cities_html;
 	esp_netif_ip_info_t ip_info;
 	esp_netif_t *netif;
 	wifi_ap_record_t ap;
-	weather_info_t w;
-	char temp_s[16];
-	char wind_s[16];
-	char tmax_s[16];
-	char tmin_s[16];
-	const char *icon;
+	city_weather_t cities[CITY_COUNT];
 	uint8_t cpu_now;
 	int rssi;
 	int n;
 	int i;
 	int used;
+	int head_len;
 
 	page = malloc(PAGE_BUF_SIZE);
-	forecast = malloc(FORECAST_BUF_SIZE);
-	if (!page || !forecast) {
+	cities_html = malloc(CITIES_HTML_SIZE);
+	if (!page || !cities_html) {
 		free(page);
-		free(forecast);
+		free(cities_html);
 		return httpd_resp_send_500(req);
 	}
 
@@ -567,42 +668,23 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 	if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
 		rssi = ap.rssi;
 
-	weather_copy(&w);
-	format_temp_x10(w.temp_x10, temp_s, sizeof(temp_s));
-	format_temp_x10(w.wind_x10, wind_s, sizeof(wind_s));
-	icon = weather_icon_slug(w.valid ? w.weather_code : -1);
-
+	weather_copy_all(cities);
 	used = 0;
-	forecast[0] = '\0';
-	if (w.valid) {
-		for (i = 0; i < WEATHER_FORECAST_DAYS; i++) {
-			if (w.day_date[i][0] == '\0')
-				continue;
-			format_temp_x10(w.day_tmax_x10[i], tmax_s, sizeof(tmax_s));
-			format_temp_x10(w.day_tmin_x10[i], tmin_s, sizeof(tmin_s));
-			n = snprintf(forecast + used, FORECAST_BUF_SIZE - used,
-				"<article class=\"day\">"
-				"<img class=\"ico\" src=\"%s%s.svg\" alt=\"\" width=\"72\" height=\"72\">"
-				"<div class=\"day-date\">%s</div>"
-				"<div class=\"day-temp\">%s…%s°</div>"
-				"<div class=\"day-desc\">%s</div>"
-				"</article>",
-				ICON_CDN, weather_icon_slug(w.day_code[i]),
-				w.day_date[i], tmin_s, tmax_s, w.day_text[i]);
-			if (n < 0 || used + n >= FORECAST_BUF_SIZE)
-				break;
-			used += n;
+	cities_html[0] = '\0';
+	for (i = 0; i < CITY_COUNT; i++) {
+		used = append_city_html(cities_html, CITIES_HTML_SIZE, used, &cities[i]);
+		if (used < 0) {
+			free(page);
+			free(cities_html);
+			return httpd_resp_send_500(req);
 		}
-	} else {
-		snprintf(forecast, FORECAST_BUF_SIZE,
-			 "<article class=\"day\"><div class=\"day-desc\">нет данных</div></article>");
 	}
 
-	n = snprintf(page, PAGE_BUF_SIZE,
+	head_len = snprintf(page, PAGE_BUF_SIZE,
 		"<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
 		"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 		"<meta http-equiv=\"refresh\" content=\"60\">"
-		"<title>Погода — Днепр</title>"
+		"<title>Погода — Днепр и Трускавец</title>"
 		"<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">"
 		"<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>"
 		"<link href=\"https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap\" rel=\"stylesheet\">"
@@ -625,8 +707,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"@keyframes float{0%%,100%%{transform:translateY(0)}50%%{transform:translateY(-8px)}}"
 		"main{max-width:720px;margin:0 auto;padding:28px 18px 40px}"
 		".brand{font-size:.85rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}"
-		"h1{font-size:clamp(1.8rem,5vw,2.6rem);margin:0 0 4px;font-weight:700}"
-		".sub{margin:0 0 22px;color:var(--muted)}"
+		".lead{margin:0 0 18px}"
+		".lead h1{font-size:clamp(1.8rem,5vw,2.4rem);margin:0 0 4px;font-weight:700}"
+		".sub{margin:0;color:var(--muted)}"
+		".city{margin:0 0 28px}"
+		".city>h1{font-size:clamp(1.5rem,4vw,2rem);margin:0 0 12px;font-weight:700}"
 		".now{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;align-items:center;"
 		"padding:18px 20px;border:1px solid var(--line);background:var(--glass);"
 		"backdrop-filter:blur(10px);border-radius:28px}"
@@ -634,11 +719,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		".temp{font-size:clamp(2.8rem,9vw,4rem);font-weight:700;line-height:1;margin:0}"
 		".desc{font-size:1.15rem;margin:6px 0 0;text-transform:capitalize}"
 		".meta{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:10px 18px;margin:8px 0 0;color:var(--muted);font-size:.95rem}"
-		".actions{margin:16px 0 28px;display:flex;gap:12px;flex-wrap:wrap}"
+		".actions{margin:8px 0 24px;display:flex;gap:12px;flex-wrap:wrap}"
 		"a.btn,button.btn{display:inline-block;padding:10px 16px;border-radius:999px;text-decoration:none;"
 		"border:0;cursor:pointer;background:#16324f;color:#f4f8fc;font:inherit;font-weight:600}"
 		"a.link{color:var(--ink);align-self:center}"
-		"h2{font-size:1.15rem;margin:0 0 12px}"
+		"h2{font-size:1.15rem;margin:16px 0 12px}"
 		".days{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}"
 		".day{padding:14px 10px 16px;text-align:center;border:1px solid var(--line);"
 		"background:rgba(255,255,255,.28);backdrop-filter:blur(8px);border-radius:22px}"
@@ -656,25 +741,30 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"@media(max-width:560px){.days{grid-template-columns:1fr}.now{grid-template-columns:1fr;justify-items:center;text-align:center}.meta{justify-content:center}}"
 		"</style></head><body><main>"
 		"<p class=\"brand\">ESP8684-MINI-1</p>"
-		"<h1>Днепр</h1>"
-		"<p class=\"sub\">погода сейчас и прогноз на 3 дня</p>"
-		"<section class=\"now\">"
-		"<img src=\"%s%s.svg\" alt=\"%s\" width=\"120\" height=\"120\">"
-		"<div><p class=\"temp\">%s°</p><p class=\"desc\">%s</p></div>"
-		"<div class=\"meta\">"
-		"<span>влажность %d%%</span>"
-		"<span>ветер %s км/ч</span>"
-		"<span>обновлено %s</span>"
-		"<span>%s</span>"
-		"</div></section>"
+		"<div class=\"lead\"><h1>Погода</h1>"
+		"<p class=\"sub\">Днепр и Трускавец · сейчас и прогноз на 3 дня</p></div>"
 		"<div class=\"actions\">"
 		"<form action=\"/refresh\" method=\"post\" style=\"margin:0\">"
 		"<button class=\"btn\" type=\"submit\">Обновить погоду</button>"
 		"</form>"
 		"<a class=\"link\" href=\"/click\">Click (%u)</a>"
-		"</div>"
-		"<h2>Прогноз</h2>"
-		"<div class=\"days\">%s</div>"
+		"</div>",
+		(unsigned)click_count);
+	if (head_len < 0 || head_len >= PAGE_BUF_SIZE) {
+		free(page);
+		free(cities_html);
+		return httpd_resp_send_500(req);
+	}
+
+	if (head_len + used >= PAGE_BUF_SIZE) {
+		free(page);
+		free(cities_html);
+		return httpd_resp_send_500(req);
+	}
+	memcpy(page + head_len, cities_html, used);
+	n = head_len + used;
+
+	i = snprintf(page + n, PAGE_BUF_SIZE - n,
 		"<section class=\"cpu\">"
 		"<div class=\"cpu-head\">"
 		"<div><strong>CPU</strong> · последние 60 с</div>"
@@ -684,7 +774,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"</section>"
 		"<div class=\"device\">"
 		"<div>SSID: %s · IP: " IPSTR " · RSSI: %d dBm</div>"
-		"<div>GPIO6: 4 Hz %s · uptime %u с · heap %u</div>"
+		"<div>uptime %u с · heap %u</div>"
 		"<div>Автообновление страницы каждые 60 с</div>"
 		"</div></main>"
 		"<script>"
@@ -715,33 +805,23 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"tick();setInterval(tick,1000);"
 		"})();"
 		"</script></body></html>",
-		ICON_CDN, icon, w.valid ? w.weather_text : "погода",
-		w.valid ? temp_s : "--",
-		w.valid ? w.weather_text : w.status,
-		w.valid ? w.humidity : 0,
-		w.valid ? wind_s : "--",
-		w.updated[0] ? w.updated : "-",
-		w.status,
-		(unsigned)click_count,
-		forecast,
 		(unsigned)cpu_now,
 		WIFI_SSID,
 		IP2STR(&ip_info.ip),
 		rssi,
-		blink_level ? "ON" : "OFF",
 		(unsigned)(esp_timer_get_time() / 1000000ULL),
 		(unsigned)esp_get_free_heap_size());
-
-	if (n < 0 || n >= PAGE_BUF_SIZE) {
+	if (i < 0 || n + i >= PAGE_BUF_SIZE) {
 		free(page);
-		free(forecast);
+		free(cities_html);
 		return httpd_resp_send_500(req);
 	}
+	n += i;
 
 	httpd_resp_set_type(req, "text/html");
 	httpd_resp_send(req, page, n);
 	free(page);
-	free(forecast);
+	free(cities_html);
 	return ESP_OK;
 }
 
