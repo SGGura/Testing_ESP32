@@ -19,11 +19,13 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 
 #define WIFI_SSID "GURAWORK"
 #define WIFI_PASS "GURA03071963"
 #define WIFI_MAX_RETRY 20
+#define MDNS_HOSTNAME "weather"
 #define BLINK_GPIO GPIO_NUM_6
 #define BLINK_HALF_MS 125
 #define WEATHER_PERIOD_MS 60000
@@ -283,16 +285,37 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 	}
 }
 
+static void start_mdns(void)
+{
+	esp_err_t err;
+
+	err = mdns_init();
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "mdns_init failed: %s", esp_err_to_name(err));
+		return;
+	}
+
+	ESP_ERROR_CHECK(mdns_hostname_set(MDNS_HOSTNAME));
+	ESP_ERROR_CHECK(mdns_instance_name_set("ESP8684 Weather"));
+	err = mdns_service_add("Weather Web", "_http", "_tcp", 80, NULL, 0);
+	if (err != ESP_OK)
+		ESP_LOGW(TAG, "mdns_service_add: %s", esp_err_to_name(err));
+
+	ESP_LOGI(TAG, "mDNS ready: http://%s.local/", MDNS_HOSTNAME);
+}
+
 static void wifi_init_sta(void)
 {
 	EventBits_t bits;
 	wifi_config_t wifi_config = { 0 };
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	esp_netif_t *netif;
 
 	wifi_event_group = xEventGroupCreate();
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	esp_netif_create_default_wifi_sta();
+	netif = esp_netif_create_default_wifi_sta();
+	ESP_ERROR_CHECK(esp_netif_set_hostname(netif, MDNS_HOSTNAME));
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -314,6 +337,7 @@ static void wifi_init_sta(void)
 				   pdFALSE, pdFALSE, portMAX_DELAY);
 	if (bits & WIFI_CONNECTED_BIT) {
 		ESP_LOGI(TAG, "connected to %s", WIFI_SSID);
+		start_mdns();
 	} else {
 		ESP_LOGE(TAG, "failed to connect to %s", WIFI_SSID);
 		abort();
@@ -776,8 +800,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"<canvas id=\"cpuChart\" width=\"680\" height=\"160\"></canvas>"
 		"</section>"
 		"<div class=\"device\">"
-		"<div>SSID: %s · IP: " IPSTR " · RSSI: %d dBm</div>"
-		"<div>uptime %u с · heap %u</div>"
+		"<div>http://%s.local/ · IP: " IPSTR " · RSSI: %d dBm</div>"
+		"<div>SSID: %s · uptime %u с · heap %u</div>"
 		"<div>Автообновление страницы каждые 60 с</div>"
 		"</div></main>"
 		"<script>"
@@ -809,9 +833,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"})();"
 		"</script></body></html>",
 		(unsigned)cpu_now,
-		WIFI_SSID,
+		MDNS_HOSTNAME,
 		IP2STR(&ip_info.ip),
 		rssi,
+		WIFI_SSID,
 		(unsigned)(esp_timer_get_time() / 1000000ULL),
 		(unsigned)esp_get_free_heap_size());
 	if (i < 0 || n + i >= PAGE_BUF_SIZE) {
