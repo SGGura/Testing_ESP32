@@ -536,8 +536,11 @@ static void weather_fetch_once(void)
 {
 	int i;
 
-	for (i = 0; i < CITY_COUNT; i++)
+	for (i = 0; i < CITY_COUNT; i++) {
 		weather_fetch_city(i);
+		if (i + 1 < CITY_COUNT)
+			vTaskDelay(pdMS_TO_TICKS(300));
+	}
 }
 
 static void weather_task(void *arg)
