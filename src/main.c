@@ -11,6 +11,7 @@
 #include "driver/gpio.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
+#include "esp_freertos_hooks.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -28,8 +29,10 @@
 #define WEATHER_PERIOD_MS 60000
 #define WEATHER_HTTP_BUF 4096
 #define WEATHER_FORECAST_DAYS 3
-#define PAGE_BUF_SIZE 8192
+#define PAGE_BUF_SIZE 10240
 #define FORECAST_BUF_SIZE 2048
+#define CPU_HIST_LEN 60
+#define CPU_SAMPLE_MS 1000
 #define ICON_CDN \
 	"https://cdn.jsdelivr.net/gh/basmilius/weather-icons@dev/production/fill/svg/"
 
@@ -50,6 +53,75 @@ static volatile uint32_t click_count;
 static httpd_handle_t http_server;
 static SemaphoreHandle_t weather_mutex;
 static SemaphoreHandle_t weather_kick;
+static SemaphoreHandle_t cpu_mutex;
+static volatile uint32_t idle_hits;
+static uint32_t idle_hits_max = 1;
+static uint8_t cpu_hist[CPU_HIST_LEN];
+static size_t cpu_hist_len;
+static size_t cpu_hist_pos;
+static uint8_t cpu_load_now;
+
+static bool cpu_idle_hook(void)
+{
+	idle_hits++;
+	return true;
+}
+
+static void cpu_hist_push(uint8_t load)
+{
+	cpu_hist[cpu_hist_pos] = load;
+	cpu_hist_pos = (cpu_hist_pos + 1) % CPU_HIST_LEN;
+	if (cpu_hist_len < CPU_HIST_LEN)
+		cpu_hist_len++;
+	cpu_load_now = load;
+}
+
+static void cpu_hist_copy(uint8_t *out, size_t *out_len, uint8_t *now)
+{
+	size_t i;
+	size_t start;
+
+	xSemaphoreTake(cpu_mutex, portMAX_DELAY);
+	*now = cpu_load_now;
+	*out_len = cpu_hist_len;
+	if (cpu_hist_len == 0) {
+		xSemaphoreGive(cpu_mutex);
+		return;
+	}
+	start = (cpu_hist_pos + CPU_HIST_LEN - cpu_hist_len) % CPU_HIST_LEN;
+	for (i = 0; i < cpu_hist_len; i++)
+		out[i] = cpu_hist[(start + i) % CPU_HIST_LEN];
+	xSemaphoreGive(cpu_mutex);
+}
+
+static void cpu_task(void *arg)
+{
+	uint32_t start;
+	uint32_t delta;
+	uint8_t load;
+
+	(void)arg;
+	esp_register_freertos_idle_hook(cpu_idle_hook);
+
+	while (1) {
+		start = idle_hits;
+		vTaskDelay(pdMS_TO_TICKS(CPU_SAMPLE_MS));
+		delta = idle_hits - start;
+		if (delta > idle_hits_max)
+			idle_hits_max = delta;
+
+		if (idle_hits_max == 0)
+			load = 0;
+		else if (delta >= idle_hits_max)
+			load = 0;
+		else
+			load = (uint8_t)(((idle_hits_max - delta) * 100U) / idle_hits_max);
+
+		xSemaphoreTake(cpu_mutex, portMAX_DELAY);
+		cpu_hist_push(load);
+		xSemaphoreGive(cpu_mutex);
+	}
+}
 
 typedef struct {
 	bool valid;
@@ -467,6 +539,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 	char tmax_s[16];
 	char tmin_s[16];
 	const char *icon;
+	uint8_t cpu_now;
 	int rssi;
 	int n;
 	int i;
@@ -479,6 +552,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		free(forecast);
 		return httpd_resp_send_500(req);
 	}
+
+	cpu_now = 0;
+	xSemaphoreTake(cpu_mutex, portMAX_DELAY);
+	cpu_now = cpu_load_now;
+	xSemaphoreGive(cpu_mutex);
 
 	netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 	memset(&ip_info, 0, sizeof(ip_info));
@@ -568,6 +646,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		".day-date{font-size:.82rem;color:var(--muted)}"
 		".day-temp{font-weight:700;margin-top:4px}"
 		".day-desc{font-size:.85rem;margin-top:4px;color:var(--muted)}"
+		".cpu{margin:28px 0 8px;padding:16px 16px 12px;border:1px solid var(--line);"
+		"background:var(--glass);backdrop-filter:blur(10px);border-radius:24px}"
+		".cpu-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px}"
+		".cpu-val{font-size:1.6rem;font-weight:700}"
+		".cpu canvas{width:100%%;height:160px;display:block;border-radius:14px;background:rgba(22,50,79,.08)}"
 		".device{margin-top:28px;padding-top:16px;border-top:1px solid rgba(22,50,79,.15);"
 		"color:var(--muted);font-size:.9rem;display:grid;gap:4px}"
 		"@media(max-width:560px){.days{grid-template-columns:1fr}.now{grid-template-columns:1fr;justify-items:center;text-align:center}.meta{justify-content:center}}"
@@ -592,11 +675,46 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"</div>"
 		"<h2>Прогноз</h2>"
 		"<div class=\"days\">%s</div>"
+		"<section class=\"cpu\">"
+		"<div class=\"cpu-head\">"
+		"<div><strong>CPU</strong> · последние 60 с</div>"
+		"<div class=\"cpu-val\" id=\"cpuNow\">%u%%</div>"
+		"</div>"
+		"<canvas id=\"cpuChart\" width=\"680\" height=\"160\"></canvas>"
+		"</section>"
 		"<div class=\"device\">"
 		"<div>SSID: %s · IP: " IPSTR " · RSSI: %d dBm</div>"
 		"<div>GPIO6: 4 Hz %s · uptime %u с · heap %u</div>"
 		"<div>Автообновление страницы каждые 60 с</div>"
-		"</div></main></body></html>",
+		"</div></main>"
+		"<script>"
+		"(function(){"
+		"const c=document.getElementById('cpuChart'),x=c.getContext('2d'),v=document.getElementById('cpuNow');"
+		"function draw(h,now){"
+		"const W=c.width,H=c.height,p=8;"
+		"x.clearRect(0,0,W,H);"
+		"x.strokeStyle='rgba(22,50,79,.18)';x.lineWidth=1;"
+		"for(let i=0;i<5;i++){const y=p+(H-2*p)*i/4;x.beginPath();x.moveTo(p,y);x.lineTo(W-p,y);x.stroke();}"
+		"if(!h||!h.length)return;"
+		"x.beginPath();"
+		"h.forEach((n,i)=>{"
+		"const px=p+(W-2*p)*(h.length===1?0:i/(h.length-1));"
+		"const py=H-p-(H-2*p)*Math.max(0,Math.min(100,n))/100;"
+		"i?x.lineTo(px,py):x.moveTo(px,py);"
+		"});"
+		"x.strokeStyle='#16324f';x.lineWidth=2.5;x.stroke();"
+		"const g=x.createLinearGradient(0,p,0,H-p);"
+		"g.addColorStop(0,'rgba(22,50,79,.28)');g.addColorStop(1,'rgba(22,50,79,0)');"
+		"x.lineTo(W-p,H-p);x.lineTo(p,H-p);x.closePath();x.fillStyle=g;x.fill();"
+		"if(typeof now==='number')v.textContent=now+'%%';"
+		"}"
+		"async function tick(){"
+		"try{const r=await fetch('/api/cpu');const d=await r.json();draw(d.hist||[],d.now);}"
+		"catch(e){}"
+		"}"
+		"tick();setInterval(tick,1000);"
+		"})();"
+		"</script></body></html>",
 		ICON_CDN, icon, w.valid ? w.weather_text : "погода",
 		w.valid ? temp_s : "--",
 		w.valid ? w.weather_text : w.status,
@@ -606,6 +724,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		w.status,
 		(unsigned)click_count,
 		forecast,
+		(unsigned)cpu_now,
 		WIFI_SSID,
 		IP2STR(&ip_info.ip),
 		rssi,
@@ -642,6 +761,40 @@ static esp_err_t refresh_get_handler(httpd_req_t *req)
 	return httpd_resp_send(req, NULL, 0);
 }
 
+static esp_err_t cpu_api_handler(httpd_req_t *req)
+{
+	uint8_t hist[CPU_HIST_LEN];
+	uint8_t now;
+	size_t len;
+	size_t i;
+	int n;
+	int used;
+	char buf[512];
+
+	cpu_hist_copy(hist, &len, &now);
+
+	used = snprintf(buf, sizeof(buf), "{\"now\":%u,\"hist\":[", (unsigned)now);
+	if (used < 0 || used >= (int)sizeof(buf))
+		return httpd_resp_send_500(req);
+
+	for (i = 0; i < len; i++) {
+		n = snprintf(buf + used, sizeof(buf) - used, "%s%u",
+			     i ? "," : "", (unsigned)hist[i]);
+		if (n < 0 || used + n >= (int)sizeof(buf))
+			return httpd_resp_send_500(req);
+		used += n;
+	}
+
+	n = snprintf(buf + used, sizeof(buf) - used, "]}");
+	if (n < 0 || used + n >= (int)sizeof(buf))
+		return httpd_resp_send_500(req);
+	used += n;
+
+	httpd_resp_set_type(req, "application/json");
+	httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+	return httpd_resp_send(req, buf, used);
+}
+
 static httpd_handle_t start_webserver(void)
 {
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -663,6 +816,12 @@ static httpd_handle_t start_webserver(void)
 		.handler = refresh_get_handler,
 		.user_ctx = NULL
 	};
+	httpd_uri_t cpu_api = {
+		.uri = "/api/cpu",
+		.method = HTTP_GET,
+		.handler = cpu_api_handler,
+		.user_ctx = NULL
+	};
 
 	config.lru_purge_enable = true;
 	config.max_open_sockets = 4;
@@ -675,6 +834,7 @@ static httpd_handle_t start_webserver(void)
 	httpd_register_uri_handler(http_server, &root);
 	httpd_register_uri_handler(http_server, &click);
 	httpd_register_uri_handler(http_server, &refresh);
+	httpd_register_uri_handler(http_server, &cpu_api);
 	ESP_LOGI(TAG, "HTTP server started on port %d", config.server_port);
 	return http_server;
 }
@@ -692,10 +852,12 @@ void app_main(void)
 
 	weather_mutex = xSemaphoreCreateMutex();
 	weather_kick = xSemaphoreCreateBinary();
-	if (!weather_mutex || !weather_kick)
+	cpu_mutex = xSemaphoreCreateMutex();
+	if (!weather_mutex || !weather_kick || !cpu_mutex)
 		abort();
 
 	xTaskCreate(blink_task, "blink", 2048, NULL, 5, NULL);
+	xTaskCreate(cpu_task, "cpu", 3072, NULL, 3, NULL);
 	wifi_init_sta();
 	start_webserver();
 	xTaskCreate(weather_task, "weather", 8192, NULL, 4, NULL);
