@@ -538,11 +538,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"radial-gradient(640px 380px at 50%% 100%%,rgba(180,220,255,.35),transparent 60%%),"
 		"linear-gradient(165deg,#6eb0e4 0%%,#9ec8ea 36%%,#d7e7f4 68%%,#eef4f8 100%%);"
 		"background-attachment:fixed}"
-		"body::before{content:\"\";position:fixed;inset:0;pointer-events:none;"
-		"background:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Ccircle cx='20' cy='30' r='18' fill='%23ffffff' fill-opacity='.11'/%3E%3Ccircle cx='90' cy='70' r='28' fill='%23ffffff' fill-opacity='.09'/%3E%3Ccircle cx='140' cy='20' r='14' fill='%23ffffff' fill-opacity='.08'/%3E%3C/svg%3E\");"
-		"opacity:.9;animation:drift 28s linear infinite}"
-		"@keyframes drift{from{transform:translateX(0)}to{transform:translateX(-80px)}}"
-		"@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}"
+		"body::before,body::after{content:\"\";position:fixed;border-radius:50%%;pointer-events:none;"
+		"background:rgba(255,255,255,.18);filter:blur(2px);animation:drift 26s linear infinite}"
+		"body::before{width:220px;height:90px;top:8%%;left:-40px;box-shadow:70px 20px 0 10px rgba(255,255,255,.12)}"
+		"body::after{width:180px;height:70px;top:18%%;right:-30px;animation-duration:34s;animation-direction:reverse;"
+		"box-shadow:-50px 16px 0 8px rgba(255,255,255,.1)}"
+		"@keyframes drift{from{transform:translateX(0)}to{transform:translateX(-90px)}}"
+		"@keyframes float{0%%,100%%{transform:translateY(0)}50%%{transform:translateY(-8px)}}"
 		"main{max-width:720px;margin:0 auto;padding:28px 18px 40px}"
 		".brand{font-size:.85rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}"
 		"h1{font-size:clamp(1.8rem,5vw,2.6rem);margin:0 0 4px;font-weight:700}"
@@ -555,8 +557,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		".desc{font-size:1.15rem;margin:6px 0 0;text-transform:capitalize}"
 		".meta{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:10px 18px;margin:8px 0 0;color:var(--muted);font-size:.95rem}"
 		".actions{margin:16px 0 28px;display:flex;gap:12px;flex-wrap:wrap}"
-		"a.btn{display:inline-block;padding:10px 16px;border-radius:999px;text-decoration:none;"
-		"background:#16324f;color:#f4f8fc;font-weight:600}"
+		"a.btn,button.btn{display:inline-block;padding:10px 16px;border-radius:999px;text-decoration:none;"
+		"border:0;cursor:pointer;background:#16324f;color:#f4f8fc;font:inherit;font-weight:600}"
 		"a.link{color:var(--ink);align-self:center}"
 		"h2{font-size:1.15rem;margin:0 0 12px}"
 		".days{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}"
@@ -583,7 +585,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 		"<span>%s</span>"
 		"</div></section>"
 		"<div class=\"actions\">"
-		"<a class=\"btn\" href=\"/refresh\">Обновить погоду</a>"
+		"<form action=\"/refresh\" method=\"post\" style=\"margin:0\">"
+		"<button class=\"btn\" type=\"submit\">Обновить погоду</button>"
+		"</form>"
 		"<a class=\"link\" href=\"/click\">Click (%u)</a>"
 		"</div>"
 		"<h2>Прогноз</h2>"
@@ -655,7 +659,7 @@ static httpd_handle_t start_webserver(void)
 	};
 	httpd_uri_t refresh = {
 		.uri = "/refresh",
-		.method = HTTP_GET,
+		.method = HTTP_POST,
 		.handler = refresh_get_handler,
 		.user_ctx = NULL
 	};
