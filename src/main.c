@@ -31,7 +31,7 @@
 #define PAGE_BUF_SIZE 8192
 #define FORECAST_BUF_SIZE 2048
 #define ICON_CDN \
-	"https://cdn.jsdelivr.net/gh/basmilius/weather-icons@3.0.0/production/fill/svg/"
+	"https://cdn.jsdelivr.net/gh/basmilius/weather-icons@dev/production/fill/svg/"
 
 #define WEATHER_URL \
 	"https://api.open-meteo.com/v1/forecast" \
