@@ -28,7 +28,10 @@
 #define WEATHER_PERIOD_MS 60000
 #define WEATHER_HTTP_BUF 4096
 #define WEATHER_FORECAST_DAYS 3
-#define PAGE_BUF_SIZE 2048
+#define PAGE_BUF_SIZE 8192
+#define FORECAST_BUF_SIZE 2048
+#define ICON_CDN \
+	"https://cdn.jsdelivr.net/gh/basmilius/weather-icons@3.0.0/production/fill/svg/"
 
 #define WEATHER_URL \
 	"https://api.open-meteo.com/v1/forecast" \
@@ -103,6 +106,39 @@ static void weather_code_text(int code, char *out, size_t out_len)
 
 	strncpy(out, text, out_len - 1);
 	out[out_len - 1] = '\0';
+}
+
+static const char *weather_icon_slug(int code)
+{
+	if (code == 0)
+		return "clear-day";
+	if (code == 1)
+		return "partly-cloudy-day";
+	if (code == 2)
+		return "partly-cloudy-day";
+	if (code == 3)
+		return "overcast";
+	if (code == 45 || code == 48)
+		return "fog";
+	if (code >= 51 && code <= 55)
+		return "drizzle";
+	if (code == 56 || code == 57)
+		return "sleet";
+	if (code >= 61 && code <= 65)
+		return "rain";
+	if (code == 66 || code == 67)
+		return "sleet";
+	if (code >= 71 && code <= 77)
+		return "snow";
+	if (code >= 80 && code <= 82)
+		return "rain";
+	if (code >= 85 && code <= 86)
+		return "snow";
+	if (code == 95)
+		return "thunderstorms";
+	if (code >= 96)
+		return "thunderstorms-rain";
+	return "not-available";
 }
 
 static void format_temp_x10(int x10, char *out, size_t out_len)
@@ -421,6 +457,7 @@ static void weather_copy(weather_info_t *out)
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
 	char *page;
+	char *forecast;
 	esp_netif_ip_info_t ip_info;
 	esp_netif_t *netif;
 	wifi_ap_record_t ap;
@@ -429,15 +466,19 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 	char wind_s[16];
 	char tmax_s[16];
 	char tmin_s[16];
-	char forecast[512];
+	const char *icon;
 	int rssi;
 	int n;
 	int i;
 	int used;
 
 	page = malloc(PAGE_BUF_SIZE);
-	if (!page)
+	forecast = malloc(FORECAST_BUF_SIZE);
+	if (!page || !forecast) {
+		free(page);
+		free(forecast);
 		return httpd_resp_send_500(req);
+	}
 
 	netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 	memset(&ip_info, 0, sizeof(ip_info));
@@ -451,6 +492,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 	weather_copy(&w);
 	format_temp_x10(w.temp_x10, temp_s, sizeof(temp_s));
 	format_temp_x10(w.wind_x10, wind_s, sizeof(wind_s));
+	icon = weather_icon_slug(w.valid ? w.weather_code : -1);
 
 	used = 0;
 	forecast[0] = '\0';
@@ -460,63 +502,123 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 				continue;
 			format_temp_x10(w.day_tmax_x10[i], tmax_s, sizeof(tmax_s));
 			format_temp_x10(w.day_tmin_x10[i], tmin_s, sizeof(tmin_s));
-			n = snprintf(forecast + used, sizeof(forecast) - used,
-				     "<li>%s: %s…%s °C, %s</li>",
-				     w.day_date[i], tmin_s, tmax_s, w.day_text[i]);
-			if (n < 0 || used + n >= (int)sizeof(forecast))
+			n = snprintf(forecast + used, FORECAST_BUF_SIZE - used,
+				"<article class=\"day\">"
+				"<img class=\"ico\" src=\"%s%s.svg\" alt=\"\" width=\"72\" height=\"72\">"
+				"<div class=\"day-date\">%s</div>"
+				"<div class=\"day-temp\">%s…%s°</div>"
+				"<div class=\"day-desc\">%s</div>"
+				"</article>",
+				ICON_CDN, weather_icon_slug(w.day_code[i]),
+				w.day_date[i], tmin_s, tmax_s, w.day_text[i]);
+			if (n < 0 || used + n >= FORECAST_BUF_SIZE)
 				break;
 			used += n;
 		}
 	} else {
-		snprintf(forecast, sizeof(forecast), "<li>нет данных</li>");
+		snprintf(forecast, FORECAST_BUF_SIZE,
+			 "<article class=\"day\"><div class=\"day-desc\">нет данных</div></article>");
 	}
 
 	n = snprintf(page, PAGE_BUF_SIZE,
-		"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+		"<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
 		"<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 		"<meta http-equiv=\"refresh\" content=\"60\">"
-		"<title>ESP8684</title></head><body>"
-		"<h1>ESP8684-MINI-1</h1>"
-		"<h2>Погода, Днепр</h2>"
-		"<p>Сейчас: %s °C, %s</p>"
-		"<p>Влажность: %d%%, ветер: %s км/ч</p>"
-		"<p>Обновлено: %s (%s)</p>"
-		"<p><a href=\"/refresh\">Обновить погоду</a></p>"
-		"<h3>Прогноз</h3><ul>%s</ul>"
-		"<hr>"
-		"<p>SSID: %s</p>"
-		"<p>IP: " IPSTR "</p>"
-		"<p>RSSI: %d dBm</p>"
-		"<p>GPIO6: 4 Hz, now %s</p>"
-		"<p>Uptime: %u s</p>"
-		"<p>Free heap: %u</p>"
-		"<p>Clicks: %u</p>"
-		"<p><a href=\"/click\">Click</a></p>"
-		"<p>Автообновление страницы: 60 с</p>"
-		"</body></html>",
+		"<title>Погода — Днепр</title>"
+		"<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">"
+		"<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>"
+		"<link href=\"https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap\" rel=\"stylesheet\">"
+		"<style>"
+		":root{--ink:#16324f;--muted:#3d5a73;--glass:rgba(255,255,255,.34);--line:rgba(255,255,255,.55)}"
+		"*{box-sizing:border-box}"
+		"body{margin:0;min-height:100vh;font-family:Outfit,Segoe UI,sans-serif;color:var(--ink);"
+		"background:"
+		"radial-gradient(900px 520px at 12%% -8%%,rgba(255,214,140,.62),transparent 58%%),"
+		"radial-gradient(780px 460px at 92%% 8%%,rgba(110,190,255,.5),transparent 55%%),"
+		"radial-gradient(640px 380px at 50%% 100%%,rgba(180,220,255,.35),transparent 60%%),"
+		"linear-gradient(165deg,#6eb0e4 0%%,#9ec8ea 36%%,#d7e7f4 68%%,#eef4f8 100%%);"
+		"background-attachment:fixed}"
+		"body::before{content:\"\";position:fixed;inset:0;pointer-events:none;"
+		"background:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Ccircle cx='20' cy='30' r='18' fill='%23ffffff' fill-opacity='.11'/%3E%3Ccircle cx='90' cy='70' r='28' fill='%23ffffff' fill-opacity='.09'/%3E%3Ccircle cx='140' cy='20' r='14' fill='%23ffffff' fill-opacity='.08'/%3E%3C/svg%3E\");"
+		"opacity:.9;animation:drift 28s linear infinite}"
+		"@keyframes drift{from{transform:translateX(0)}to{transform:translateX(-80px)}}"
+		"@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}"
+		"main{max-width:720px;margin:0 auto;padding:28px 18px 40px}"
+		".brand{font-size:.85rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}"
+		"h1{font-size:clamp(1.8rem,5vw,2.6rem);margin:0 0 4px;font-weight:700}"
+		".sub{margin:0 0 22px;color:var(--muted)}"
+		".now{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;align-items:center;"
+		"padding:18px 20px;border:1px solid var(--line);background:var(--glass);"
+		"backdrop-filter:blur(10px);border-radius:28px}"
+		".now img{width:120px;height:120px;animation:float 5s ease-in-out infinite}"
+		".temp{font-size:clamp(2.8rem,9vw,4rem);font-weight:700;line-height:1;margin:0}"
+		".desc{font-size:1.15rem;margin:6px 0 0;text-transform:capitalize}"
+		".meta{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:10px 18px;margin:8px 0 0;color:var(--muted);font-size:.95rem}"
+		".actions{margin:16px 0 28px;display:flex;gap:12px;flex-wrap:wrap}"
+		"a.btn{display:inline-block;padding:10px 16px;border-radius:999px;text-decoration:none;"
+		"background:#16324f;color:#f4f8fc;font-weight:600}"
+		"a.link{color:var(--ink);align-self:center}"
+		"h2{font-size:1.15rem;margin:0 0 12px}"
+		".days{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}"
+		".day{padding:14px 10px 16px;text-align:center;border:1px solid var(--line);"
+		"background:rgba(255,255,255,.28);backdrop-filter:blur(8px);border-radius:22px}"
+		".day .ico{width:72px;height:72px;margin:0 auto 4px;display:block}"
+		".day-date{font-size:.82rem;color:var(--muted)}"
+		".day-temp{font-weight:700;margin-top:4px}"
+		".day-desc{font-size:.85rem;margin-top:4px;color:var(--muted)}"
+		".device{margin-top:28px;padding-top:16px;border-top:1px solid rgba(22,50,79,.15);"
+		"color:var(--muted);font-size:.9rem;display:grid;gap:4px}"
+		"@media(max-width:560px){.days{grid-template-columns:1fr}.now{grid-template-columns:1fr;justify-items:center;text-align:center}.meta{justify-content:center}}"
+		"</style></head><body><main>"
+		"<p class=\"brand\">ESP8684-MINI-1</p>"
+		"<h1>Днепр</h1>"
+		"<p class=\"sub\">погода сейчас и прогноз на 3 дня</p>"
+		"<section class=\"now\">"
+		"<img src=\"%s%s.svg\" alt=\"%s\" width=\"120\" height=\"120\">"
+		"<div><p class=\"temp\">%s°</p><p class=\"desc\">%s</p></div>"
+		"<div class=\"meta\">"
+		"<span>влажность %d%%</span>"
+		"<span>ветер %s км/ч</span>"
+		"<span>обновлено %s</span>"
+		"<span>%s</span>"
+		"</div></section>"
+		"<div class=\"actions\">"
+		"<a class=\"btn\" href=\"/refresh\">Обновить погоду</a>"
+		"<a class=\"link\" href=\"/click\">Click (%u)</a>"
+		"</div>"
+		"<h2>Прогноз</h2>"
+		"<div class=\"days\">%s</div>"
+		"<div class=\"device\">"
+		"<div>SSID: %s · IP: " IPSTR " · RSSI: %d dBm</div>"
+		"<div>GPIO6: 4 Hz %s · uptime %u с · heap %u</div>"
+		"<div>Автообновление страницы каждые 60 с</div>"
+		"</div></main></body></html>",
+		ICON_CDN, icon, w.valid ? w.weather_text : "погода",
 		w.valid ? temp_s : "--",
 		w.valid ? w.weather_text : w.status,
 		w.valid ? w.humidity : 0,
 		w.valid ? wind_s : "--",
 		w.updated[0] ? w.updated : "-",
 		w.status,
+		(unsigned)click_count,
 		forecast,
 		WIFI_SSID,
 		IP2STR(&ip_info.ip),
 		rssi,
 		blink_level ? "ON" : "OFF",
 		(unsigned)(esp_timer_get_time() / 1000000ULL),
-		(unsigned)esp_get_free_heap_size(),
-		(unsigned)click_count);
+		(unsigned)esp_get_free_heap_size());
 
 	if (n < 0 || n >= PAGE_BUF_SIZE) {
 		free(page);
+		free(forecast);
 		return httpd_resp_send_500(req);
 	}
 
 	httpd_resp_set_type(req, "text/html");
 	httpd_resp_send(req, page, n);
 	free(page);
+	free(forecast);
 	return ESP_OK;
 }
 
